@@ -1,153 +1,185 @@
-q# Camel on Quarkusプロジェクト
+# Camel Kafka File Integration Project
 
-このプロジェクトは、Apache CamelとQuarkusの統合を示しており、Kafkaとファイル処理に焦点を当てています。
+このプロジェクトは、Quarkusを使用してApache CamelをKafkaおよびファイルシステムと統合する方法を示しています。プロジェクトには、Kafkaヘッダーのカスタムシリアライザーおよびデシリアライザーと、ファイルとKafkaトピック間でデータを転送するルートが含まれています。
 
 ## プロジェクト構成
 
-- `pom.xml`: Maven設定ファイル
-- `application.properties`: アプリケーション設定ファイル
-- `KafkaToFileRoute.java`: Kafkaから読み込み、ファイルに書き込むルート定義
-- `FileToKafkaRoute.java`: ファイルから読み込み、Kafkaに書き込むルート定義
-- `CustomKafkaHeaderDeserializer.java`: Kafkaヘッダー用のカスタムデシリアライザー
-- `CustomKafkaHeaderSerializer.java`: Kafkaヘッダー用のカスタムシリアライザー
+- `pom.xml`: 依存関係とビルドプラグインを含むMaven設定ファイル。
+- `application.properties`: アプリケーションの設定ファイル。
+- `FileToKafkaRoute.java`: ファイルからデータを読み取り、Kafkaに送信するCamelルート。
+- `KafkaToFileRoute.java`: Kafkaからデータを読み取り、ファイルに書き込むCamelルート。
+- `CustomKafkaHeaderSerializer.java`: Kafkaヘッダーのカスタムシリアライザー。
+- `CustomKafkaHeaderDeserializer.java`: Kafkaヘッダーのカスタムデシリアライザー。
 
 ## 前提条件
 
-- Java 17以降
+- Java 17
 - Maven 3.8.1以降
-- Docker（必要に応じてKafkaのセットアップ用）
+- Quarkus 3.8.5
+- Apache Kafka
 
-## 依存関係
+## 始めに
 
-このプロジェクトでは、以下の依存関係を使用しています：
+1. **リポジトリをクローン:**
 
-```xml
-<dependencies>
-    <dependency>
-        <groupId>org.apache.camel.quarkus</groupId>
-        <artifactId>camel-quarkus-file</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.camel.quarkus</groupId>
-        <artifactId>camel-quarkus-log</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.camel.quarkus</groupId>
-        <artifactId>camel-quarkus-core</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.camel.quarkus</groupId>
-        <artifactId>camel-quarkus-kafka</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>io.quarkus</groupId>
-        <artifactId>quarkus-arc</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>org.apache.camel.quarkus</groupId>
-        <artifactId>camel-quarkus-zipfile</artifactId>
-    </dependency>
-    <dependency>
-        <groupId>io.quarkus</groupId>
-        <artifactId>quarkus-junit5</artifactId>
-        <scope>test</scope>
-    </dependency>
-</dependencies>
-```
+   ```sh
+   git clone https://github.com/your-repo/camel-kafka-file.git
+   cd camel-kafka-file
+   ```
+
+2. **プロジェクトをビルド:**
+
+   ```sh
+   mvn clean install
+   ```
+
+3. **アプリケーションを実行:**
+
+   ```sh
+   mvn quarkus:dev
+   ```
 
 ## 設定
 
-設定は`application.properties`ファイルで提供されています：
+アプリケーションの設定は`application.properties`ファイルで管理されます。
 
 ```properties
-# Kafkaの設定
-kafka.bootstrap.servers=localhost:9092
-kafka.topic.input=my-input-topic
-kafka.topic.output=my-output-topic
+kafka.brokers=localhost:9092
+kafka.deadletter.topic = deadLetterTopic
+kafka.consumer.group = deadLetterGroup
 
-# ファイルパス
-file.input.path=/path/to/input/files
-file.output.path=/path/to/output/files
+camel.component.kafka.value-serializer=org.apache.kafka.common.serialization.ByteArraySerializer
+camel.component.kafka.value-deserializer=org.apache.kafka.common.serialization.ByteArrayDeserializer
+camel.component.kafka.key-serializer=org.apache.kafka.common.serialization.StringSerializer
+camel.component.kafka.key-deserializer=org.apache.kafka.common.serialization.StringDeserializer
+camel.component.kafka.header-serializer=#class:com.sample.utils.CustomKafkaHeaderSerializer
+camel.component.kafka.header-deserializer=#class:com.sample.utils.CustomKafkaHeaderDeserializer
 
-# 必要に応じた他の設定
+camel.file.input.directory=/Users/kjin/Camel/data/input
+camel.file.output.directory=/Users/kjin/Camel/data/output
+
+file.transfer.timeout = 300000
 ```
 
 ## ルート
 
-### Kafkaからファイルへのルート
+### FileToKafkaRoute
 
-`KafkaToFileRoute.java`で定義：
+このルートは指定されたディレクトリからファイルを読み取り、その内容をKafkaトピックに送信します。
 
 ```java
-public class KafkaToFileRoute extends RouteBuilder {
+from("file:{{camel.file.input.directory}}?noop=false&include=.*\\.zip&filter=#fileFilter")
+    .routeId("file-to-kafka-route")
+    .log("Processing file: ${header.CamelFileName}")
+    .setHeader("OriginalFileName", simple("${header.CamelFileName}"))
+    .process(exchange -> {
+        String fileId = UUID.randomUUID().toString();
+        exchange.getIn().setHeader("FileId", fileId);
+        exchange.getIn().setHeader(KafkaConstants.KEY, fileId);
+    })
+    .log("Starting split operation")
+    .process(exchange -> {
+        byte[] fileContent = exchange.getIn().getBody(byte[].class);
+        long fileSize = fileContent != null ? fileContent.length : 0;
+
+        if (fileSize == 0) {
+            exchange.setProperty("FileIsEmpty", true);
+        } else {
+            exchange.setProperty("FileIsEmpty", false);
+        }
+    })
+    .choice()
+        .when(exchangeProperty("FileIsEmpty").isEqualTo(true))
+            .log("Skipping empty file: ${header.CamelFileName}")
+            .stop()
+        .otherwise()
+            .process(this::splitFileIntoChunks)
+            .split(body())
+                .setHeader("ChunkIndex", simple("${exchangeProperty.CamelSplitIndex}"))
+                .setHeader("TotalChunks", simple("${exchangeProperty.CamelSplitSize}"))
+                .log("Processing ChunkIndex: ${header.ChunkIndex}\tTotalChunks: ${header.TotalChunks}")
+                .to("kafka:{{kafka.topic.output}}")
+                .log("Sent chunk ${header.ChunkIndex} of ${header.TotalChunks} to Kafka for file: ${header.OriginalFileName}")
+            .end()
+    .log("Finished processing file: ${header.CamelFileName}")
+    .end();
+```
+
+### KafkaToFileRoute
+
+このルートはKafkaトピックからメッセージを読み取り、指定されたディレクトリに書き込みます。
+
+```java
+from("kafka:{{kafka.deadletter.topic}}?brokers={{kafka.bootstrap.servers}}&groupId=my-consumer-group")
+    .routeId("kafka-to-file-route")
+    .log("Received message from Kafka: ${header.OriginalFileName}")
+    .process(this::processChunk)
+    .choice()
+        .when(this::isFileComplete)
+            .process(this::reconstructFile)
+            .log("Reconstructed file: ${header.OriginalFileName}")
+    .end();
+
+from("timer:fileTimeout?period=60000")
+    .process(this::checkAllFilesTimeout);
+```
+
+## カスタムKafkaヘッダーシリアライザーとデシリアライザー
+
+プロジェクトには、Kafkaメッセージのヘッダーを処理するためのカスタムシリアライザーおよびデシリアライザーが含まれています。
+
+### CustomKafkaHeaderSerializer
+
+Kafkaメッセージのカスタムヘッダーをシリアライズします。
+
+```java
+public class CustomKafkaHeaderSerializer implements KafkaHeaderSerializer {
+    private final StringSerializer delegate = new StringSerializer();
+
     @Override
-    public void configure() {
-        from("kafka:{{kafka.topic.input}}")
-            .routeId("KafkaToFile")
-            .log("Received message from Kafka: ${body}")
-            .to("file:{{file.output.path}}");
+    public byte[] serialize(String key, Object value) {
+        return delegate.serialize(key, value.toString());
     }
 }
 ```
 
-### ファイルからKafkaへのルート
+### CustomKafkaHeaderDeserializer
 
-`FileToKafkaRoute.java`で定義：
+Kafkaメッセージのカスタムヘッダーをデシリアライズします。
 
 ```java
-public class FileToKafkaRoute extends RouteBuilder {
+public class CustomKafkaHeaderDeserializer implements KafkaHeaderDeserializer {
+    private final StringDeserializer delegate = new StringDeserializer();
+
     @Override
-    public void configure() {
-        from("file:{{file.input.path}}?noop=true")
-            .routeId("FileToKafka")
-            .log("Read file: ${file:name}")
-            .to("kafka:{{kafka.topic.output}}");
+    public Object deserialize(String key, byte[] value) {
+        return delegate.deserialize(key, value);
     }
 }
 ```
 
-## カスタムシリアライザー/デシリアライザー
+## 処理の概要と工夫したポイント
 
-### カスタムKafkaヘッダーデシリアライザー
+### 処理の概要
 
-`CustomKafkaHeaderDeserializer.java`で定義：
+1. **FileToKafkaRoute.java**:
+    - ローカルファイルシステムからファイルを読み込み、その内容をKafkaトピックに送信します。
+    - ファイル名や内容をログに記録します。
+    - ファイルの完全なコピーが確認されるまで処理を開始しません 。
 
-```java
-public class CustomKafkaHeaderDeserializer implements Deserializer<Object> {
-    @Override
-    public Object deserialize(String topic, byte[] data) {
-        // カスタムデシリアライズロジック
-    }
-}
-```
+2. **KafkaToFileRoute.java**:
+    - Kafkaトピックからメッセージを読み込み、ローカルファイルシステムに書き込みます。
+    - 受信したメッセージの内容をログに記録します。
+    - メッセージのチャンクを順序通りに再構成し、タイムアウトを監視します  【9†source】 。
 
-### カスタムKafkaヘッダーシリアライザー
+### 工夫したポイント
 
-`CustomKafkaHeaderSerializer.java`で定義：
+- **完全なファイルコピーの確認**:
+    - ファイルが完全にコピーされるのを待つために、ファイルサイズが変わらないことを確認しています。これにより、未完全なファイルを処理することを防ぎます  。
 
-```java
-public class CustomKafkaHeaderSerializer implements Serializer<Object> {
-    @Override
-    public byte[] serialize(String topic, Object data) {
-        // カスタムシリアライズロジック
-    }
-}
-```
+- **チャンクの順序保証と再構成**:
+    - ファイルを900KBのチャンクに分割し、それぞれのチャンクをKafkaに送信します  。
+    - Kafkaから受信したチャンクをTreeMapを使用して順序通りに保持し、全てのチャンクが揃ったら再構成してファイルに書き出します  【9†source】 。
+    - タイムアウトを監視し、一定時間以上活動がない場合はエラー処理を実行します 【9†source】 。
 
-## プロジェクトの実行
-
-プロジェクトを実行するには、以下のMavenコマンドを使用します：
-
-```bash
-mvn clean compile quarkus:dev
-```
-
-## プロジェクトのビルド
-
-ネイティブ実行のためにプロジェクトをビルドするには、以下のMavenコマンドを使用します：
-
-```bash
-mvn clean package -Pnative
-```
-
-これにより、`target`ディレクトリにネイティブ実行ファイルが作成されます。
+このREADMEがプロジェクトの理解とセットアップに役立つことを願っています。詳細や質問がある場合は、お気軽にお問い合わせください。
